@@ -1,0 +1,677 @@
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from rest_framework_simplejwt.authentication import JWTStatelessUserAuthentication
+from rest_framework_simplejwt.models import TokenUser
+from rest_framework import status
+from django.core.files.storage import default_storage
+import json
+from .models import Job, JobApplication
+from accounts.models import AccountsUser
+from django.core.files.storage import default_storage
+from io import BytesIO
+try:
+    from pdfminer.high_level import extract_text as pdf_extract_text
+except Exception:
+    pdf_extract_text = None
+
+from jd_analyzer.utils_ai import compare_resume_with_jd
+
+class CreateJobAPI(APIView):
+    authentication_classes = [JWTStatelessUserAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        # Extract fields
+        title = request.data.get("title")
+        department = request.data.get("department")
+        location = request.data.get("location")
+        job_type = request.data.get("type")
+        salary = request.data.get("salary")
+        description = request.data.get("description")
+        assigned_recruiter = request.data.get("assigned_recruiter")
+        # accept required_skills as JSON string or list or comma-separated string
+        required_skills_raw = request.data.get("required_skills")
+        required_skills = []
+        if required_skills_raw:
+            try:
+                if isinstance(required_skills_raw, str):
+                    required_skills = json.loads(required_skills_raw)
+                else:
+                    required_skills = required_skills_raw
+            except Exception:
+                # fallback: comma separated
+                required_skills = [s.strip() for s in str(required_skills_raw).split(',') if s.strip()]
+        jd_file = request.FILES.get("jd_file")
+
+        # save uploaded file if present
+        file_path = None
+        if jd_file:
+            file_path = default_storage.save(f'job_descriptions/{jd_file.name}', jd_file)
+
+        job = Job.objects.create(
+            title=title,
+            department=department,
+            location=location,
+            type=job_type,
+            salary=salary,
+            description=description,
+            assigned_recruiter=assigned_recruiter,
+            jd_file=file_path,
+            required_skills=required_skills,
+            created_by=None,
+        )
+        # Try to set `created_by` when a real Django User is present; TokenUser is stateless
+        try:
+            # request.user will be a TokenUser (stateless) if JWTStatelessUserAuthentication is used.
+            accounts_user = None
+
+            # Try lookup by primary key (id) from token claims
+            try:
+                token_user_id = request.user.id
+                if token_user_id:
+                    try:
+                        accounts_user = AccountsUser.objects.get(pk=int(token_user_id))
+                    except (ValueError, AccountsUser.DoesNotExist):
+                        accounts_user = None
+            except Exception:
+                accounts_user = None
+
+            # If not found by id, try username claim
+            if not accounts_user:
+                username = getattr(request.user, 'username', None)
+                if username:
+                    try:
+                        accounts_user = AccountsUser.objects.get(username=username)
+                    except AccountsUser.DoesNotExist:
+                        accounts_user = None
+
+            if accounts_user:
+                job.created_by = accounts_user
+                job.save()
+        except Exception:
+            # Saving created_by is optional — if it fails, the job will still be created
+            pass
+
+        return Response({
+            "message": "Job created successfully!",
+            "id": job.id,
+            "created_by_id": job.created_by.id if job.created_by else None,
+            "created_by_username": job.created_by.username if job.created_by else None,
+        }, status=status.HTTP_201_CREATED)
+
+
+class UpdateJobAPI(APIView):
+    authentication_classes = [JWTStatelessUserAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def put(self, request, job_id):
+        try:
+            job = Job.objects.get(pk=job_id)
+        except Job.DoesNotExist:
+            return Response({'error': 'Job not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Update fields
+        job.title = request.data.get('title', job.title)
+        job.department = request.data.get('department', job.department)
+        job.location = request.data.get('location', job.location)
+        job.type = request.data.get('type', job.type)
+        job.salary = request.data.get('salary', job.salary)
+        job.description = request.data.get('description', job.description)
+        job.assigned_recruiter = request.data.get('assigned_recruiter', job.assigned_recruiter)
+        # update required_skills if provided
+        if 'required_skills' in request.data:
+            rs_raw = request.data.get('required_skills')
+            try:
+                if isinstance(rs_raw, str):
+                    job.required_skills = json.loads(rs_raw)
+                else:
+                    job.required_skills = rs_raw
+            except Exception:
+                job.required_skills = [s.strip() for s in str(rs_raw).split(',') if s.strip()]
+
+        # Handle file upload if present
+        jd_file = request.FILES.get('jd_file')
+        if jd_file:
+            job.jd_file = default_storage.save(f'job_descriptions/{jd_file.name}', jd_file)
+
+        job.save()
+
+        return Response({
+            'message': 'Job updated successfully!',
+            'id': job.id,
+            'created_by_username': job.created_by.username if job.created_by else None,
+        }, status=status.HTTP_200_OK)
+
+
+class DeleteJobAPI(APIView):
+    authentication_classes = [JWTStatelessUserAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, job_id):
+        try:
+            job = Job.objects.get(pk=job_id)
+        except Job.DoesNotExist:
+            return Response({'error': 'Job not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        job.delete()
+        return Response({
+            'message': 'Job deleted successfully!'
+        }, status=status.HTTP_204_NO_CONTENT)
+
+
+
+class ListJobsAPI(APIView):
+    authentication_classes = [JWTStatelessUserAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        # Fetch all jobs ordered by created_by, then by created_at descending
+        jobs = Job.objects.select_related('created_by').order_by('created_by', '-created_at')
+        
+        # Serialize jobs with created_by info
+        job_list = []
+        for job in jobs:
+            job_data = {
+                'id': job.id,
+                'title': job.title,
+                'department': job.department,
+                'location': job.location,
+                'type': job.type,
+                'salary': job.salary,
+                'description': job.description,
+                'assigned_recruiter': job.assigned_recruiter,
+                'jd_file': job.jd_file.url if job.jd_file else None,
+                'required_skills': job.required_skills if hasattr(job, 'required_skills') else [],
+                'created_by_id': job.created_by.id if job.created_by else None,
+                'created_by_username': job.created_by.username if job.created_by else None,
+                'created_at': job.created_at.isoformat() if job.created_at else None,
+            }
+            job_list.append(job_data)
+        
+        return Response(job_list, status=status.HTTP_200_OK)
+
+
+class ApplyJobAPI(APIView):
+    authentication_classes = [JWTStatelessUserAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        """
+        Candidate applies for a job.
+        Expected payload:
+        {
+            "job_id": <int>,
+            "cover_letter": "<string>"
+        }
+        """
+        job_id = request.data.get('job_id')
+        cover_letter = request.data.get('cover_letter', '')
+
+        if not job_id:
+            return Response({'error': 'job_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Get job
+        try:
+            job = Job.objects.get(pk=job_id)
+        except Job.DoesNotExist:
+            return Response({'error': 'Job not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Resolve candidate AccountsUser
+        candidate = None
+        
+        # Try by user id from token
+        try:
+            token_user_id = request.user.id
+            if token_user_id:
+                try:
+                    candidate = AccountsUser.objects.get(pk=int(token_user_id))
+                except (ValueError, AccountsUser.DoesNotExist):
+                    candidate = None
+        except Exception:
+            candidate = None
+
+        # Try by username if id lookup failed
+        if not candidate:
+            username = getattr(request.user, 'username', None)
+            if username:
+                try:
+                    candidate = AccountsUser.objects.get(username=username)
+                except AccountsUser.DoesNotExist:
+                    candidate = None
+
+        if not candidate:
+            return Response({'error': 'Associated candidate account not found'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check if already applied
+        existing = JobApplication.objects.filter(job=job, candidate=candidate).first()
+        if existing:
+            return Response(
+                {'message': 'You have already applied for this job', 'status': existing.status},
+                status=status.HTTP_409_CONFLICT
+            )
+
+        # Create application
+        application = JobApplication.objects.create(
+            job=job,
+            candidate=candidate,
+            cover_letter=cover_letter,
+            status='applied'
+        )
+
+        return Response({
+            'message': 'Application submitted successfully!',
+            'application_id': application.id,
+            'job_title': job.title,
+            'status': application.status,
+        }, status=status.HTTP_201_CREATED)
+
+
+class ListApplicationsAPI(APIView):
+    authentication_classes = [JWTStatelessUserAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, job_id):
+        """
+        HR views all applicants for a specific job.
+        Returns list of applications with candidate profile details.
+        """
+        try:
+            job = Job.objects.get(pk=job_id)
+        except Job.DoesNotExist:
+            return Response({'error': 'Job not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Fetch all applications for this job
+        applications = JobApplication.objects.filter(job=job).select_related(
+            'candidate'
+        ).order_by('-applied_at')
+
+        # Serialize with candidate profile data
+        app_list = []
+        for app in applications:
+            # Get candidate profile if available
+            candidate_profile = None
+            try:
+                from myprofile.models import CandidateProfile
+                candidate_profile = CandidateProfile.objects.filter(user=app.candidate).order_by('-updated_at').first()
+            except Exception:
+                candidate_profile = None
+
+            app_data = {
+                'id': app.id,
+                'job_id': app.job.id,
+                'candidate_id': app.candidate.id,
+                'candidate_username': app.candidate.username,
+                'cover_letter': app.cover_letter,
+                'status': app.status,
+                'applied_at': app.applied_at.isoformat(),
+                'updated_at': app.updated_at.isoformat(),
+                # Candidate profile fields
+                'candidate_profile': {
+                    'fullName': candidate_profile.full_name if candidate_profile else app.candidate.username,
+                    'email': candidate_profile.email if candidate_profile else None,
+                    'phone': candidate_profile.phone if candidate_profile else None,
+                    'location': candidate_profile.location if candidate_profile else None,
+                    'title': candidate_profile.title if candidate_profile else None,
+                    'bio': candidate_profile.bio if candidate_profile else None,
+                    'yearsOfExperience': candidate_profile.years_of_experience if candidate_profile else None,
+                    'skills': candidate_profile.skills if candidate_profile else [],
+                    'experience': candidate_profile.experience if candidate_profile else [],
+                    'education': candidate_profile.education if candidate_profile else [],
+                    'profilePhoto': f'/media/{candidate_profile.profile_photo.name}' if candidate_profile and candidate_profile.profile_photo else None,
+                    'resume': f'/media/{candidate_profile.resume.name}' if candidate_profile and candidate_profile.resume else None,
+                } if candidate_profile else {
+                    'fullName': app.candidate.username,
+                    'email': None,
+                    'phone': None,
+                    'location': None,
+                    'title': None,
+                    'bio': None,
+                    'yearsOfExperience': None,
+                    'skills': [],
+                    'experience': [],
+                    'education': [],
+                    'profilePhoto': None,
+                    'resume': None,
+                }
+            }
+            app_list.append(app_data)
+
+        return Response(app_list, status=status.HTTP_200_OK)
+
+
+class ListAllApplicationsAPI(APIView):
+    authentication_classes = [JWTStatelessUserAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        """
+        HR views all applicants for all jobs they have posted.
+        """
+        # Resolve HR AccountsUser similar to other endpoints
+        hr_account = None
+        try:
+            token_user_id = request.user.id
+            if token_user_id:
+                try:
+                    hr_account = AccountsUser.objects.get(pk=int(token_user_id))
+                except (ValueError, AccountsUser.DoesNotExist):
+                    hr_account = None
+        except Exception:
+            hr_account = None
+
+        if not hr_account:
+            username = getattr(request.user, 'username', None)
+            if username:
+                try:
+                    hr_account = AccountsUser.objects.get(username=username)
+                except AccountsUser.DoesNotExist:
+                    hr_account = None
+
+        # If we have an HR account, restrict to jobs created by them
+        if hr_account:
+            jobs = Job.objects.filter(created_by=hr_account)
+            applications = JobApplication.objects.filter(job__in=jobs).select_related('candidate').order_by('-applied_at')
+        else:
+            # fallback: return all applications (admin-like)
+            applications = JobApplication.objects.select_related('candidate').order_by('-applied_at')
+
+        app_list = []
+        for app in applications:
+            try:
+                from myprofile.models import CandidateProfile
+                candidate_profile = CandidateProfile.objects.filter(user=app.candidate).order_by('-updated_at').first()
+            except Exception:
+                candidate_profile = None
+
+            app_data = {
+                'id': app.id,
+                'job_id': app.job.id,
+                'job_title': app.job.title,
+                'candidate_id': app.candidate.id,
+                'candidate_username': app.candidate.username,
+                'cover_letter': app.cover_letter,
+                'status': app.status,
+                'applied_at': app.applied_at.isoformat(),
+                'updated_at': app.updated_at.isoformat(),
+                'candidate_profile': {
+                    'fullName': candidate_profile.full_name if candidate_profile else app.candidate.username,
+                    'email': candidate_profile.email if candidate_profile else None,
+                    'phone': candidate_profile.phone if candidate_profile else None,
+                    'location': candidate_profile.location if candidate_profile else None,
+                    'title': candidate_profile.title if candidate_profile else None,
+                    'bio': candidate_profile.bio if candidate_profile else None,
+                    'yearsOfExperience': candidate_profile.years_of_experience if candidate_profile else None,
+                    'skills': candidate_profile.skills if candidate_profile else [],
+                    'experience': candidate_profile.experience if candidate_profile else [],
+                    'education': candidate_profile.education if candidate_profile else [],
+                    'profilePhoto': f'/media/{candidate_profile.profile_photo.name}' if candidate_profile and candidate_profile.profile_photo else None,
+                    'resume': f'/media/{candidate_profile.resume.name}' if candidate_profile and candidate_profile.resume else None,
+                } if candidate_profile else {
+                    'fullName': app.candidate.username,
+                    'email': None,
+                    'phone': None,
+                    'location': None,
+                    'title': None,
+                    'bio': None,
+                    'yearsOfExperience': None,
+                    'skills': [],
+                    'experience': [],
+                    'education': [],
+                    'profilePhoto': None,
+                    'resume': None,
+                }
+            }
+            app_list.append(app_data)
+
+        return Response(app_list, status=status.HTTP_200_OK)
+
+
+class UpdateApplicationStatusAPI(APIView):
+    authentication_classes = [JWTStatelessUserAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def put(self, request, app_id):
+        """
+        HR updates application status.
+        Expected payload:
+        {
+            "status": "reviewing|shortlisted|rejected"
+        }
+        """
+        status_value = request.data.get('status')
+
+        if not status_value:
+            return Response({'error': 'status is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if status_value not in ['applied', 'reviewing', 'shortlisted', 'rejected']:
+            return Response(
+                {'error': f'Invalid status. Must be one of: applied, reviewing, shortlisted, rejected'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            application = JobApplication.objects.get(pk=app_id)
+        except JobApplication.DoesNotExist:
+            return Response({'error': 'Application not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        application.status = status_value
+        application.save()
+
+        return Response({
+            'message': 'Application status updated successfully!',
+            'id': application.id,
+            'status': application.status,
+            'updated_at': application.updated_at.isoformat(),
+        }, status=status.HTTP_200_OK)
+
+
+class ApplicationCompatibilityAPI(APIView):
+    """Compute compatibility for a specific application (job vs candidate resume).
+
+    GET /api/applications/<app_id>/compatibility/
+    """
+    authentication_classes = [JWTStatelessUserAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, app_id):
+        try:
+            app = JobApplication.objects.select_related('job', 'candidate').get(pk=app_id)
+        except JobApplication.DoesNotExist:
+            return Response({'error': 'Application not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Get candidate profile and resume file
+        try:
+            from myprofile.models import CandidateProfile
+            profile = CandidateProfile.objects.filter(user=app.candidate).order_by('-updated_at').first()
+        except Exception:
+            profile = None
+
+        if not profile or not profile.resume:
+            return Response({'error': 'Candidate resume not available'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+        resume_file = profile.resume
+        # Extract text
+        resume_text = None
+        try:
+            fname = resume_file.name.lower()
+            if fname.endswith('.pdf') and pdf_extract_text:
+                content = resume_file.read()
+                resume_text = pdf_extract_text(BytesIO(content))
+            elif fname.endswith('.txt'):
+                resume_text = resume_file.read().decode('utf-8', errors='ignore')
+            elif fname.endswith(('.doc', '.docx')):
+                try:
+                    from docx import Document
+                    doc = Document(BytesIO(resume_file.read()))
+                    resume_text = '\n'.join([p.text for p in doc.paragraphs])
+                except Exception:
+                    resume_text = resume_file.read().decode('utf-8', errors='ignore')
+            else:
+                resume_text = resume_file.read().decode('utf-8', errors='ignore')
+        except Exception as e:
+            return Response({'error': f'Resume extraction failed: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        if not resume_text or len(resume_text.strip()) == 0:
+            return Response({'error': 'Resume extraction returned empty text'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Use job.description as JD text (fallback to title)
+        jd_text = app.job.description or app.job.title or ''
+        result = compare_resume_with_jd(jd_text, resume_text)
+        return Response(result)
+
+
+class ChatConversationsAPI(APIView):
+    """List all chat conversations (applicants/job applications) for HR and candidate.
+    
+    GET /api/conversations/chat/
+    Returns list of conversations formatted for message inbox.
+    """
+    authentication_classes = [JWTStatelessUserAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        conversations = []
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Resolve AccountsUser from token claims
+        accounts_user = None
+        try:
+            token_user_id = user.id
+            if token_user_id:
+                try:
+                    accounts_user = AccountsUser.objects.get(pk=int(token_user_id))
+                    logger.info(f"Found user by ID: {accounts_user.username}")
+                except (ValueError, AccountsUser.DoesNotExist):
+                    accounts_user = None
+        except Exception as e:
+            logger.warning(f"Error resolving user by ID: {e}")
+            pass
+
+        if not accounts_user:
+            username = getattr(user, 'username', None)
+            if username:
+                try:
+                    accounts_user = AccountsUser.objects.get(username=username)
+                    logger.info(f"Found user by username: {username}")
+                except AccountsUser.DoesNotExist:
+                    logger.warning(f"User not found with username: {username}")
+                    accounts_user = None
+
+        if not accounts_user:
+            logger.error(f"Could not resolve AccountsUser from token. user.id={getattr(user, 'id', None)}, user.username={getattr(user, 'username', None)}")
+            return Response({'error': 'User not found'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        # Check if user is HR or candidate
+        is_hr = accounts_user.role == 'hr'
+        is_candidate = accounts_user.role == 'candidate'
+        logger.info(f"User {accounts_user.username} - role={accounts_user.role}, is_hr={is_hr}, is_candidate={is_candidate}")
+
+        if is_hr:
+            # HR sees applicants for their posted jobs
+            from myprofile.models import CandidateProfile
+            hr_jobs = Job.objects.filter(created_by=accounts_user)
+            logger.info(f"HR {accounts_user.username} has {hr_jobs.count()} jobs")
+            applications = JobApplication.objects.filter(job__in=hr_jobs).select_related('job', 'candidate')
+            logger.info(f"Found {applications.count()} applications for HR {accounts_user.username}")
+            for app in applications:
+                candidate = app.candidate
+                # Safely attempt to fetch candidate profile; always append the conversation entry
+                profile = None
+                try:
+                    profile = CandidateProfile.objects.filter(user=candidate).first()
+                except Exception:
+                    profile = None
+
+                # derive display name and email (profile may use different attribute names)
+                display_name = (getattr(profile, 'fullName', None) or getattr(profile, 'full_name', None)) if profile else candidate.username
+                display_email = getattr(profile, 'email', None) if profile else getattr(candidate, 'email', None)
+
+                conversations.append({
+                    'id': f'applicant-{app.id}',
+                    'type': 'applicant',
+                    'name': display_name,
+                    'role': f"Applied for: {app.job.title}",
+                    'lastMessage': f"Applicant status: {app.status}",
+                    'timestamp': app.created_at.strftime('%b %d, %I:%M %p') if app.created_at else 'Unknown',
+                    'unread': 0,
+                    'isOnline': True,
+                    'applicationId': app.id,
+                    'jobTitle': app.job.title,
+                    'candidateUsername': candidate.username,
+                    'candidate_profile': {
+                        'fullName': display_name,
+                        'email': display_email,
+                        'phone': getattr(profile, 'phone', None) if profile else None,
+                        'location': getattr(profile, 'location', None) if profile else None,
+                        'title': getattr(profile, 'title', None) if profile else None,
+                        'bio': getattr(profile, 'bio', None) if profile else None,
+                        'yearsOfExperience': (getattr(profile, 'yearsOfExperience', None) if profile and hasattr(profile, 'yearsOfExperience') else getattr(profile, 'years_of_experience', None)) if profile else None,
+                        'skills': getattr(profile, 'skills', []) if profile else [],
+                        'experience': getattr(profile, 'experience', []) if profile else [],
+                        'education': getattr(profile, 'education', []) if profile else [],
+                        'profilePhoto': f"/media/{getattr(profile, 'profile_photo').name}" if profile and getattr(profile, 'profile_photo', None) else None,
+                        'resume': f"/media/{getattr(profile, 'resume').name}" if profile and getattr(profile, 'resume', None) else None,
+                    }
+                })
+
+        elif is_candidate:
+            # Candidate sees job applications they made (conversations with HR)
+            from myprofile.models import CandidateProfile
+            applications = JobApplication.objects.filter(candidate=accounts_user).select_related('job', 'job__created_by')
+            logger.info(f"Candidate {accounts_user.username} has {applications.count()} applications")
+            for app in applications:
+                try:
+                    hr_profile = app.job.created_by
+                    name = f"HR - {hr_profile.username}" if hr_profile else "HR Team"
+                except Exception:
+                    name = "HR Team"
+                
+                conversations.append({
+                    'id': f'job-application-{app.id}',
+                    'type': 'job-application',
+                    'name': name,
+                    'role': f"For: {app.job.title}",
+                    'lastMessage': f"Status: {app.status}",
+                    'timestamp': app.created_at.strftime('%b %d, %I:%M %p') if app.created_at else 'Unknown',
+                    'unread': 0,
+                    'isOnline': True,
+                    'applicationId': app.id,
+                    'jobTitle': app.job.title,
+                    'hr_profile': {
+                        'username': hr_profile.username if hr_profile else None,
+                        'email': getattr(hr_profile, 'email', None) if hr_profile else None,
+                        'id': hr_profile.id if hr_profile else None,
+                    },
+                })
+
+        return Response(conversations)
+
+
+class HRDashboardAPI(APIView):
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTStatelessUserAuthentication]
+
+    def get(self, request):
+        total_jobs = Job.objects.count()
+        total_applications = JobApplication.objects.count()
+        pending_applications = JobApplication.objects.filter(status__in=['applied', 'reviewing']).count()
+        approved_applications = JobApplication.objects.filter(status='shortlisted').count()
+        rejected_applications = JobApplication.objects.filter(status='rejected').count()
+        total_candidates = AccountsUser.objects.filter(role='Candidate').count()
+        recent_jobs = Job.objects.order_by('-created_at')[:5].values('title', 'department', 'created_at')
+        recent_applications = JobApplication.objects.select_related('job', 'candidate').order_by('-applied_at')[:5].values('job__title', 'candidate__username', 'status', 'applied_at')
+        data = {
+            'total_jobs': total_jobs,
+            'total_applications': total_applications,
+            'pending_applications': pending_applications,
+            'approved_applications': approved_applications,
+            'rejected_applications': rejected_applications,
+            'total_candidates': total_candidates,
+            'recent_jobs': list(recent_jobs),
+            'recent_applications': list(recent_applications),
+        }
+        return Response(data)
